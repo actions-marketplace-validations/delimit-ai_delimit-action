@@ -26,6 +26,9 @@ mcp = [
 [project.scripts]
 delimit = "delimit_gateway.cli:main"
 
+[tool.setuptools.packages.find]
+include = ["delimit_gateway*", "core*", "schemas*", "tasks*"]
+
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
