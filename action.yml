@@ -59,8 +59,8 @@ runs:
     - name: Run Delimit validation
       run: |
         python -m delimit_gateway.cli validate-api \
-          --old-spec ${{ inputs.old_spec || 'auto' }} \
-          --new-spec ${{ inputs.new_spec || 'auto' }}
+          "${{ inputs.old_spec }}" \
+          "${{ inputs.new_spec }}"
       shell: bash
     
     - name: Comment on PR
