@@ -335,25 +335,31 @@ organization:
         return template
 
 
-def evaluate_with_policy(old_spec: Dict, new_spec: Dict, policy_file: Optional[str] = None) -> Dict[str, Any]:
+def evaluate_with_policy(
+    old_spec: Dict, new_spec: Dict,
+    policy_file: Optional[str] = None,
+    include_semver: bool = False,
+    current_version: Optional[str] = None,
+    api_name: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Main entry point for policy evaluation.
-    
+
     Returns:
         Dictionary with violations, summary, and decision.
     """
     # Run diff engine
     diff_engine = OpenAPIDiffEngine()
     changes = diff_engine.compare(old_spec, new_spec)
-    
+
     # Run policy engine
     policy_engine = PolicyEngine(policy_file)
     violations = policy_engine.evaluate(changes)
-    
+
     # Determine decision
     has_errors = any(v.severity == "error" for v in violations)
     has_warnings = any(v.severity == "warning" for v in violations)
-    
+
     if has_errors:
         decision = "fail"
         exit_code = 1
@@ -363,8 +369,8 @@ def evaluate_with_policy(old_spec: Dict, new_spec: Dict, policy_file: Optional[s
     else:
         decision = "pass"
         exit_code = 0
-    
-    return {
+
+    result = {
         "decision": decision,
         "exit_code": exit_code,
         "violations": [
@@ -395,3 +401,29 @@ def evaluate_with_policy(old_spec: Dict, new_spec: Dict, policy_file: Optional[s
             for c in changes
         ]
     }
+
+    # Semver classification
+    if include_semver:
+        try:
+            from core.semver_classifier import classify_detailed, bump_version
+            semver_data = classify_detailed(changes)
+            semver_result = {"bump": semver_data["bump"].value}
+            if current_version:
+                semver_result["current_version"] = current_version
+                semver_result["next_version"] = bump_version(current_version, semver_data["bump"])
+            result["semver"] = semver_result
+        except Exception:
+            result["semver"] = {"bump": "none"}
+
+    # Migration guide
+    if include_semver and any(c.is_breaking for c in changes):
+        try:
+            from core.explainer import explain
+            old_ver = current_version or "unknown"
+            next_ver = result.get("semver", {}).get("next_version", "next")
+            name = api_name or "API"
+            result["migration"] = explain(changes, "migration", old_ver, next_ver, name)
+        except Exception:
+            pass
+
+    return result
