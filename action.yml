@@ -7,13 +7,11 @@ branding:
 
 inputs:
   old_spec:
-    description: 'Path to old/base API specification (auto-detected if not provided)'
-    required: false
-    default: ''
+    description: 'Path to the old/base OpenAPI spec file (YAML or JSON)'
+    required: true
   new_spec:
-    description: 'Path to new/changed API specification (auto-detected if not provided)'
-    required: false
-    default: ''
+    description: 'Path to the new/changed OpenAPI spec file (YAML or JSON)'
+    required: true
   mode:
     description: 'Mode: advisory (comments only) or enforce (fail CI on breaking changes)'
     required: false
@@ -73,13 +71,8 @@ runs:
         new_path = "${{ inputs.new_spec }}"
 
         if not old_path or not new_path:
-            print("::notice::No spec files provided. Skipping validation.")
-            with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
-                f.write("breaking_changes=false\n")
-                f.write("violations_count=0\n")
-                f.write("semver_bump=none\n")
-                f.write("report={}\n")
-            sys.exit(0)
+            print("::error::Both old_spec and new_spec inputs are required.")
+            sys.exit(1)
 
         def load(p):
             with open(p) as f:

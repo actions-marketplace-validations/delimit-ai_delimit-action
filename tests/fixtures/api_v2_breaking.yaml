@@ -1,0 +1,104 @@
+openapi: "3.0.3"
+info:
+  title: User Service
+  version: "2.0.0"
+  description: A simple user management API (v2 with breaking changes).
+
+paths:
+  # /users/{id}/profile REMOVED (breaking: endpoint_removed)
+
+  /users:
+    get:
+      operationId: listUsers
+      summary: List all users
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+        # NEW required parameter (breaking: required_param_added)
+        - name: org_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A list of users
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/User"
+    post:
+      operationId: createUser
+      summary: Create a new user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserCreate"
+      responses:
+        "201":
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+
+  /users/{id}:
+    get:
+      operationId: getUser
+      summary: Get a user by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          # Type changed from string to integer (breaking: type_changed)
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: A single user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "404":
+          description: User not found
+
+components:
+  schemas:
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+        role:
+          type: string
+          enum:
+            - admin
+            - user
+            # "guest" removed (breaking: enum_value_removed)
+      required:
+        - id
+        - name
+        - email
+
+    UserCreate:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+      required:
+        - name
+        - email

@@ -1,0 +1,79 @@
+name: Test Delimit Core
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install pyyaml pydantic packaging pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+  self-test-advisory:
+    name: Self-test (advisory mode, breaking fixtures)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Delimit in advisory mode with breaking changes
+        id: advisory
+        uses: ./
+        with:
+          old_spec: tests/fixtures/api_v1.yaml
+          new_spec: tests/fixtures/api_v2_breaking.yaml
+          mode: advisory
+
+      - name: Verify advisory outputs
+        run: |
+          echo "breaking_changes=${{ steps.advisory.outputs.breaking_changes_detected }}"
+          echo "semver_bump=${{ steps.advisory.outputs.semver_bump }}"
+          echo "violations_count=${{ steps.advisory.outputs.violations_count }}"
+
+          if [ "${{ steps.advisory.outputs.breaking_changes_detected }}" != "true" ]; then
+            echo "FAIL: Expected breaking_changes_detected=true"
+            exit 1
+          fi
+          echo "PASS: Advisory mode detected breaking changes and did not fail CI."
+
+  self-test-enforce:
+    name: Self-test (enforce mode, safe fixtures)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Delimit in enforce mode with safe changes
+        id: enforce
+        uses: ./
+        with:
+          old_spec: tests/fixtures/api_v1.yaml
+          new_spec: tests/fixtures/api_v2_safe.yaml
+          mode: enforce
+
+      - name: Verify enforce outputs
+        run: |
+          echo "breaking_changes=${{ steps.enforce.outputs.breaking_changes_detected }}"
+          echo "semver_bump=${{ steps.enforce.outputs.semver_bump }}"
+
+          if [ "${{ steps.enforce.outputs.breaking_changes_detected }}" != "false" ]; then
+            echo "FAIL: Expected breaking_changes_detected=false for safe changes"
+            exit 1
+          fi
+          echo "PASS: Enforce mode passed with safe changes."
