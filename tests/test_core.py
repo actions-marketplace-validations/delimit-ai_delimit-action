@@ -288,7 +288,9 @@ class TestExplainerTemplates(unittest.TestCase):
 
     def test_pr_comment_has_table(self):
         output = explain(self.breaking_changes, template="pr_comment")
-        self.assertIn("| Metric | Value |", output)
+        self.assertIn("| Change | Location | Severity |", output)
+        self.assertIn("MAJOR", output)
+        self.assertIn("Migration guide", output)
 
     def test_slack_has_icon(self):
         output = explain(self.breaking_changes, template="slack")
