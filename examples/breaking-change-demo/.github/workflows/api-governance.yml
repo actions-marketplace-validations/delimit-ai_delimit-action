@@ -1,6 +1,10 @@
 name: API Governance Demo
 on: [pull_request]
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   check-breaking-changes:
     runs-on: ubuntu-latest
