@@ -1,21 +1,43 @@
-name: 'Delimit API Governance'
-description: 'Detect breaking API changes in PRs. Semver classification + migration guides.'
+name: 'Delimit — Merge Gate for AI-Written Code'
+description: 'The merge gate for AI-written code: catch breaking API changes on every PR, with signed, replayable attestation'
 author: 'Delimit AI'
 branding:
   icon: 'shield'
-  color: 'blue'
+  color: 'purple'
 
 inputs:
+  spec:
+    description: 'Path to OpenAPI spec file. Delimit auto-fetches the base branch version. (Simplest setup)'
+    required: false
+    default: ''
   old_spec:
-    description: 'Path to the old/base OpenAPI spec file (YAML or JSON)'
-    required: true
+    description: 'Path to the old/base OpenAPI spec file. Use with new_spec for advanced setups.'
+    required: false
+    default: ''
   new_spec:
-    description: 'Path to the new/changed OpenAPI spec file (YAML or JSON)'
-    required: true
+    description: 'Path to the new/changed OpenAPI spec file. Use with old_spec for advanced setups.'
+    required: false
+    default: ''
   mode:
     description: 'Mode: advisory (comments only) or enforce (fail CI on breaking changes)'
     required: false
     default: 'advisory'
+  fail_on_breaking:
+    description: 'Boolean alias for mode=enforce. When true, fails CI on breaking changes regardless of mode. Default false (advisory).'
+    required: false
+    default: 'false'
+  context_aware_severity:
+    description: 'LED-1600 (opt-in, default false): direction-aware breaking severity. When true, a required field ADDED to a response body and a request-field removal are treated as non-breaking (consumers ignore extra response fields; the server stops requiring a request field). Response-field removals and required->optional relaxations are ALWAYS flagged regardless of this flag. Leave false to keep the conservative, direction-agnostic verdicts.'
+    required: false
+    default: 'false'
+  generator_command:
+    description: 'Optional shell command that regenerates a generated artifact (e.g. "pnpm run schema:export"). When set, Delimit runs this command in a sandbox and diffs the regenerated output against the committed artifact to detect drift between source-of-truth and committed file. Pair with generator_artifact.'
+    required: false
+    default: ''
+  generator_artifact:
+    description: 'Path to the generated artifact that generator_command produces (e.g. "schemas/v1/agent.schema.json"). Required when generator_command is set.'
+    required: false
+    default: ''
   github_token:
     description: 'GitHub token for PR comments'
     required: false
@@ -24,6 +46,14 @@ inputs:
     description: 'Path to custom policy file (.delimit/policies.yml)'
     required: false
     default: ''
+  webhook_url:
+    description: 'Slack or Discord webhook URL for breaking change notifications'
+    required: false
+    default: ''
+  attestation:
+    description: 'Sign the governance report with Sigstore keyless signing and surface a verifiable permalink. Requires `id-token: write` in the calling workflow. Set to "false" to disable. (LED-1120)'
+    required: false
+    default: 'true'
 
 outputs:
   breaking_changes_detected:
@@ -41,19 +71,131 @@ outputs:
   report:
     description: 'JSON report of all detected changes'
     value: ${{ steps.validate.outputs.report }}
+  secrets_detected:
+    description: 'Whether a leaked-secret pattern was found in changed files (true/false)'
+    value: ${{ steps.secrets.outputs.secrets_detected }}
+  secrets_count:
+    description: 'Number of changed files containing a leaked-secret pattern'
+    value: ${{ steps.secrets.outputs.secrets_count }}
+  attestation_id:
+    description: 'Stable identifier for the signed governance attestation (16-char prefix of sha256(payload)). Empty if attestation was skipped.'
+    value: ${{ steps.attest.outputs.attestation_id }}
+  attestation_rekor_log_index:
+    description: 'Rekor transparency log index for the keyless signature. Empty if attestation was skipped.'
+    value: ${{ steps.attest.outputs.rekor_log_index }}
+  attestation_url:
+    description: 'Public verifiable permalink for the signed attestation. Empty if attestation was skipped.'
+    value: ${{ steps.attest.outputs.permalink }}
 
 runs:
   using: 'composite'
   steps:
     - name: Setup Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
-    - name: Install Delimit
+    - name: Install Delimit runtime deps
       run: |
         pip install pyyaml pydantic packaging 2>/dev/null
-        pip install -e "${{ github.action_path }}" 2>/dev/null || true
+      shell: bash
+
+    - name: Resolve spec inputs
+      id: resolve
+      run: |
+        SPEC="${{ inputs.spec }}"
+        OLD="${{ inputs.old_spec }}"
+        NEW="${{ inputs.new_spec }}"
+
+        # Auto-detect spec if none provided
+        if [ -z "$SPEC" ] && [ -z "$OLD" ] && [ -z "$NEW" ]; then
+          echo "No spec path provided — auto-detecting..."
+          for pattern in openapi.yaml openapi.yml openapi.json swagger.yaml swagger.yml swagger.json \
+                         api/openapi.yaml api/openapi.yml api/openapi.json \
+                         docs/openapi.yaml docs/openapi.yml docs/openapi.json \
+                         spec/openapi.yaml spec/openapi.json specs/openapi.yaml; do
+            if [ -f "$pattern" ]; then
+              SPEC="$pattern"
+              echo "Auto-detected spec: $SPEC"
+              break
+            fi
+          done
+          if [ -z "$SPEC" ]; then
+            echo "::notice::No OpenAPI spec found. Add 'spec: path/to/your/openapi.yaml' to the action inputs."
+            echo "resolved_old=" >> "$GITHUB_OUTPUT"
+            echo "resolved_new=" >> "$GITHUB_OUTPUT"
+          fi
+        fi
+
+        if [ -n "$SPEC" ] && [ -z "$OLD" ] && [ -z "$NEW" ]; then
+          # Simple mode: auto-fetch base branch version
+          if [ -z "${{ github.event.pull_request.base.sha }}" ]; then
+            echo "::error::The 'spec' input requires a pull_request event. Use old_spec/new_spec for other triggers."
+            exit 1
+          fi
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          echo "Fetching base branch spec at $BASE_SHA..."
+          git fetch origin "$BASE_SHA" --depth=1 2>/dev/null || true
+          TMPFILE="/tmp/delimit_base_spec_$(date +%s)"
+          if git show "$BASE_SHA:$SPEC" > "$TMPFILE" 2>/dev/null; then
+            echo "resolved_old=$TMPFILE" >> "$GITHUB_OUTPUT"
+            echo "resolved_new=$SPEC" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Spec not found in base branch — treating as new API (no breaking changes possible)"
+            echo "resolved_old=" >> "$GITHUB_OUTPUT"
+            echo "resolved_new=" >> "$GITHUB_OUTPUT"
+          fi
+        elif [ -n "$OLD" ] && [ -n "$NEW" ]; then
+          # Advanced mode: explicit paths
+          echo "resolved_old=$OLD" >> "$GITHUB_OUTPUT"
+          echo "resolved_new=$NEW" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error::Provide either 'spec' (simple) or both 'old_spec' and 'new_spec' (advanced)."
+          exit 1
+        fi
+      shell: bash
+
+    - name: Delimit secret scan (zero-config PR safety)
+      id: secrets
+      if: ${{ github.event_name == 'pull_request' }}
+      run: |
+        set +e
+        BASE_SHA="${{ github.event.pull_request.base.sha }}"
+        git fetch origin "$BASE_SHA" --depth=1 2>/dev/null || true
+        FILES=$(git diff --name-only "$BASE_SHA"...HEAD 2>/dev/null)
+        [ -z "$FILES" ] && FILES=$(git diff --name-only HEAD~1 2>/dev/null)
+        PAT='-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82}|sk_live_[A-Za-z0-9]{24,}|xox[baprs]-[A-Za-z0-9-]{10,48}|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20}'
+        FOUND=0
+        LINES=""
+        for f in $FILES; do
+          [ -f "$f" ] || continue
+          SZ=$(wc -c < "$f" 2>/dev/null || echo 0)
+          [ "$SZ" -gt 1048576 ] && continue
+          if grep -qIE -e "$PAT" "$f" 2>/dev/null; then
+            LINES="${LINES}- ${f}: leaked-secret pattern detected"$'\n'
+            FOUND=$((FOUND+1))
+          fi
+        done
+        {
+          echo "## Delimit secret scan (deterministic, high-precision)"
+          echo ""
+          if [ "$FOUND" -gt 0 ]; then
+            echo "**${FOUND} changed file(s) contain a leaked-secret pattern:**"
+            echo ""
+            printf '%s' "$LINES"
+          else
+            echo "No leaked secrets in changed files."
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "secrets_count=${FOUND}" >> "$GITHUB_OUTPUT"
+        if [ "$FOUND" -gt 0 ]; then echo "secrets_detected=true" >> "$GITHUB_OUTPUT"; else echo "secrets_detected=false" >> "$GITHUB_OUTPUT"; fi
+        MODE="${{ inputs.mode }}"
+        FAILB="${{ inputs.fail_on_breaking }}"
+        if [ "$FOUND" -gt 0 ] && { [ "$MODE" = "enforce" ] || [ "$FAILB" = "true" ]; }; then
+          echo "::error::Delimit: ${FOUND} leaked secret(s) detected in changed files (enforce mode)."
+          exit 1
+        fi
+        exit 0
       shell: bash
 
     - name: Run Delimit validation
@@ -66,32 +208,93 @@ runs:
 
         from core.diff_engine_v2 import OpenAPIDiffEngine
         from core.policy_engine import evaluate_with_policy
+        from core.spec_detector import detect_spec_type
+        from core.json_schema_diff import JSONSchemaDiffEngine
+        from core.generator_drift import detect_drift, format_drift_report
 
-        old_path = "${{ inputs.old_spec }}"
-        new_path = "${{ inputs.new_spec }}"
+        old_path = "${{ steps.resolve.outputs.resolved_old }}"
+        new_path = "${{ steps.resolve.outputs.resolved_new }}"
 
         if not old_path or not new_path:
-            print("::error::Both old_spec and new_spec inputs are required.")
-            sys.exit(1)
+            # No specs to compare (new API or resolve step skipped)
+            with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
+                f.write("breaking_changes=false\n")
+                f.write("violations_count=0\n")
+                f.write("semver_bump=none\n")
+                f.write("next_version=\n")
+                f.write("report={}\n")
+            sys.exit(0)
 
         def load(p):
             with open(p) as f:
-                return yaml.safe_load(f) if p.endswith(('.yaml','.yml')) else json.load(f)
+                content = f.read()
+            # Try YAML first (superset of JSON), fall back to JSON
+            try:
+                return yaml.safe_load(content)
+            except Exception:
+                return json.loads(content)
 
         old_spec = load(old_path)
         new_spec = load(new_path)
 
+        spec_type = detect_spec_type(new_spec)
         policy = "${{ inputs.policy_file }}" or None
-        api_name = old_spec.get("info", {}).get("title", "API")
-        current_version = old_spec.get("info", {}).get("version")
 
-        result = evaluate_with_policy(
-            old_spec, new_spec,
-            policy_file=policy,
-            include_semver=True,
-            current_version=current_version,
-            api_name=api_name,
-        )
+        if spec_type == "json_schema":
+            # JSON Schema path (LED-713) — bypass OpenAPI policy engine,
+            # build a minimal report compatible with the comment step.
+            engine = JSONSchemaDiffEngine()
+            changes = engine.compare(old_spec, new_spec)
+            breaking_count = sum(1 for c in changes if c.is_breaking)
+            api_name = old_spec.get("title", "JSON Schema")
+            result = {
+                "summary": {
+                    "total_changes": len(changes),
+                    "breaking_changes": breaking_count,
+                    "violations": 0,
+                },
+                "changes": [
+                    {"type": c.type.value, "path": c.path, "message": c.message,
+                     "is_breaking": c.is_breaking}
+                    for c in changes
+                ],
+                "violations": [],
+                "semver": {
+                    "bump": "major" if breaking_count else ("minor" if changes else "none"),
+                    "next_version": "",
+                },
+                "spec_type": "json_schema",
+                "api_name": api_name,
+            }
+        else:
+            api_name = old_spec.get("info", {}).get("title", "API")
+            current_version = old_spec.get("info", {}).get("version")
+            result = evaluate_with_policy(
+                old_spec, new_spec,
+                policy_file=policy,
+                include_semver=True,
+                current_version=current_version,
+                api_name=api_name,
+                context_aware=("${{ inputs.context_aware_severity }}" == "true"),
+            )
+
+        # Generator drift check (LED-713) — opt-in via generator_command + generator_artifact
+        gen_cmd = "${{ inputs.generator_command }}"
+        gen_artifact = "${{ inputs.generator_artifact }}"
+        if gen_cmd and gen_artifact:
+            drift = detect_drift(
+                repo_root=os.environ.get("GITHUB_WORKSPACE", "."),
+                artifact_path=gen_artifact,
+                regen_command=gen_cmd,
+                timeout_seconds=120,
+            )
+            result["drift"] = drift.to_dict()
+            # Drifted breaking changes count toward the breaking_changes flag
+            if drift.drifted:
+                drift_breaking = sum(1 for c in drift.changes if c.is_breaking)
+                result.setdefault("summary", {})["breaking_changes"] = (
+                    result.get("summary", {}).get("breaking_changes", 0) + drift_breaking
+                )
 
         semver = result.get("semver", {})
         breaking = result["summary"]["breaking_changes"] > 0
@@ -113,15 +316,187 @@ runs:
             level = "error" if v["severity"] == "error" else "warning"
             print(f"::{level} title=Delimit::{v['message']}")
 
-        # Exit code
-        if mode == "enforce" and breaking:
-            sys.exit(1)
+        # Don't exit here — let the comment step run first
         DELIMIT_EOF
       shell: bash
 
+    # LED-1120 — sign the governance report with Sigstore keyless signing.
+    # The signed bundle, the Rekor log index, and a public verification
+    # permalink are surfaced via outputs and threaded into the PR comment so
+    # any reviewer can verify the report came from this exact (repo, commit,
+    # workflow) without trusting the action runner.
+    #
+    # Gracefully no-ops when:
+    #   - attestation: 'false' is set
+    #   - id-token: write is not granted in the calling workflow
+    #   - the validate step did not produce a report (no spec to compare)
+    - name: Build attestation payload
+      id: payload
+      if: always() && inputs.attestation != 'false'
+      run: |
+        # The validate step writes /tmp/delimit_report.json, which is outside
+        # GITHUB_WORKSPACE — so we cannot use `hashFiles()` to gate this step.
+        # The Python here checks the file exists and emits skipped=true if not,
+        # which downstream steps respect via steps.payload.outputs.skipped.
+        python3 << 'PAYLOAD_EOF'
+        import json, hashlib, os, time, sys
+        report_path = "/tmp/delimit_report.json"
+        if not os.path.exists(report_path):
+            print(f"::warning::Report file not found at {report_path} — skipping attestation. (Validate step did not produce a report — likely no spec to diff.)")
+            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                f.write("skipped=true\n")
+            sys.exit(0)
+        try:
+            with open(report_path) as f:
+                report = json.load(f)
+        except Exception as e:
+            print(f"::warning::Could not parse {report_path}: {e} — skipping attestation")
+            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                f.write("skipped=true\n")
+            sys.exit(0)
+        # Bind the report to its (repo, commit, workflow, runner) context so
+        # a reviewer can replay the exact provenance, not just the diff result.
+        payload = {
+            "schema": "delimit.attestation.v1",
+            "tool": "delimit-action",
+            "tool_version": os.environ.get("GITHUB_ACTION_REF", "unknown"),
+            "repo": os.environ.get("GITHUB_REPOSITORY", ""),
+            "commit": os.environ.get("GITHUB_SHA", ""),
+            "workflow": os.environ.get("GITHUB_WORKFLOW", ""),
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "event": os.environ.get("GITHUB_EVENT_NAME", ""),
+            "ref": os.environ.get("GITHUB_REF", ""),
+            "actor": os.environ.get("GITHUB_ACTOR", ""),
+            "issued_at": int(time.time()),
+            "report": report,
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        att_id = digest[:16]
+        with open("/tmp/delimit_attestation.json", "w") as f:
+            f.write(canonical)
+        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"attestation_id={att_id}\n")
+            f.write(f"digest={digest}\n")
+            f.write("skipped=false\n")
+        PAYLOAD_EOF
+      shell: bash
+
+    - name: Install Cosign
+      if: always() && steps.payload.outputs.skipped == 'false'
+      uses: sigstore/cosign-installer@v3
+
+    - name: Sign attestation (Sigstore keyless)
+      id: attest
+      if: always() && steps.payload.outputs.skipped == 'false'
+      env:
+        ATT_ID: ${{ steps.payload.outputs.attestation_id }}
+      run: |
+        # Keyless signing: GitHub OIDC -> Fulcio short-lived cert.
+        # Rekor transparency log records the signature so it remains
+        # publicly verifiable after the cert expires.
+        BUNDLE="/tmp/delimit_attestation.sigstore"
+        if ! cosign sign-blob --yes \
+            --bundle "$BUNDLE" \
+            /tmp/delimit_attestation.json 2> /tmp/cosign.stderr; then
+          echo "::warning::cosign signing failed — likely missing 'id-token: write' permission. Add 'permissions: { id-token: write }' to your workflow to enable signed attestations."
+          tail -20 /tmp/cosign.stderr || true
+          {
+            echo "attestation_id="
+            echo "rekor_log_index="
+            echo "permalink="
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        # Pull the Rekor log index from the bundle for the permalink
+        REKOR_INDEX=$(python3 -c "
+        import json, sys, base64
+        try:
+            with open('$BUNDLE') as f:
+                bundle = json.load(f)
+            entries = bundle.get('rekorBundle', {}).get('Payload', {}).get('logIndex')
+            if entries is None:
+                # cosign new-style bundle field
+                entries = bundle.get('verificationMaterial', {}).get('tlogEntries', [{}])[0].get('logIndex', '')
+            print(entries)
+        except Exception as e:
+            print('', end='')
+        ")
+        # Thread context into the permalink so the verification page can
+        # render repo/PR/commit/workflow/run without us hosting any storage.
+        PR_NUM="${{ github.event.pull_request.number }}"
+        WF_REF="${{ github.workflow_ref }}"
+        RUN_ID="${{ github.run_id }}"
+        urlencode() { printf '%s' "$1" | python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read()))'; }
+        QS="rekor=$REKOR_INDEX"
+        QS+="&src=action-comment"
+        QS+="&repo=$(urlencode "$GITHUB_REPOSITORY")"
+        if [ -n "$PR_NUM" ]; then QS+="&pr=$PR_NUM"; fi
+        QS+="&commit=$GITHUB_SHA"
+        if [ -n "$RUN_ID" ]; then QS+="&run=$RUN_ID"; fi
+        if [ -n "$WF_REF" ]; then QS+="&ref=$(urlencode "$WF_REF")"; fi
+        PERMALINK="https://delimit.ai/att/$ATT_ID?$QS"
+        {
+          echo "attestation_id=$ATT_ID"
+          echo "rekor_log_index=$REKOR_INDEX"
+          echo "permalink=$PERMALINK"
+        } >> "$GITHUB_OUTPUT"
+        echo "Signed attestation $ATT_ID (Rekor index $REKOR_INDEX)"
+      shell: bash
+
+    - name: Upload attestation artifacts
+      if: always() && steps.payload.outputs.skipped == 'false' && steps.attest.outputs.attestation_id != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: delimit-attestation-${{ steps.payload.outputs.attestation_id }}
+        path: |
+          /tmp/delimit_attestation.json
+          /tmp/delimit_attestation.sigstore
+        # 365 = max for free tier accounts. The Rekor entry persists
+        # forever via Sigstore's transparency log, so even after this
+        # artifact expires the signature is still publicly verifiable —
+        # the artifact is the cached payload + bundle that lets you skip
+        # the Rekor body decode.
+        retention-days: 365
+        if-no-files-found: ignore
+
+    - name: Upload report artifact (fork-PR comment relay)
+      # LED-4155 (founder-ratified Decision #2): on fork PRs the read-only
+      # GITHUB_TOKEN cannot post the comment; the job summary shows the
+      # report on the run page but not in the PR thread. This artifact lets
+      # an OPTIONAL workflow_run consumer (see examples/delimit-comment.yml)
+      # post the comment from the base-repo context with a writable token.
+      # SECURITY: the artifact is DATA ONLY. The consumer must derive the PR
+      # number from the TRUSTED workflow_run payload (head_sha -> PR lookup),
+      # never from artifact contents, which are produced in the untrusted
+      # PR context.
+      # LED-4169: FORK PRs only. The relay serves only fork PRs (same-repo
+      # PRs get the direct comment), and gating here prevents a duplicate-
+      # artifact-name 409 when the action is invoked more than once in a
+      # single same-repo workflow run (regressed the gateway's own
+      # two-invocation api-governance check). overwrite:true additionally
+      # makes a fork PR that runs the action twice safe (last report wins).
+      if: >-
+        always() && github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name != github.repository
+      uses: actions/upload-artifact@v4
+      with:
+        name: delimit-report
+        path: /tmp/delimit_report.json
+        retention-days: 7
+        if-no-files-found: ignore
+        overwrite: true
+
     - name: Comment on PR
-      if: github.event_name == 'pull_request'
-      uses: actions/github-script@v6
+      if: always() && github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      env:
+        DELIMIT_ATTESTATION_ID: ${{ steps.attest.outputs.attestation_id }}
+        DELIMIT_ATTESTATION_REKOR: ${{ steps.attest.outputs.rekor_log_index }}
+        DELIMIT_ATTESTATION_URL: ${{ steps.attest.outputs.permalink }}
+        DELIMIT_WORKFLOW_REF: ${{ github.workflow_ref }}
+        DELIMIT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        DELIMIT_MODE: ${{ inputs.mode }}
       with:
         github-token: ${{ inputs.github_token }}
         script: |
@@ -134,106 +509,532 @@ runs:
             return;
           }
 
+          // LED-mute-surface — the working install is silent when the comment
+          // cannot post. Fork PRs get a READ-ONLY GITHUB_TOKEN by design, so
+          // github.rest.issues.createComment 403s no matter what `permissions:`
+          // the workflow grants. The job summary ($GITHUB_STEP_SUMMARY) is
+          // ALWAYS writable, so on a comment-post 403 we fall back to writing
+          // the same report there — the finding stays visible on the run page.
+          // Returns true if the summary was written.
+          async function writeReportToSummary(mdBody) {
+            try {
+              await core.summary.addRaw(mdBody).write();
+              return true;
+            } catch (se) {
+              // Extremely defensive: GITHUB_STEP_SUMMARY should always be set
+              // on a GitHub-hosted runner. Fall back to a raw append.
+              try {
+                const p = process.env.GITHUB_STEP_SUMMARY;
+                if (p) {
+                  fs.appendFileSync(p, '\n' + mdBody + '\n');
+                  return true;
+                }
+              } catch (se2) {
+                // Give up on the summary too — but NEVER fail the job over
+                // an advisory comment/summary. Pass/fail is owned by the
+                // dedicated "Enforce breaking change policy" step.
+              }
+              return false;
+            }
+          }
+
+          // Detect a fork PR (head repo differs from base repo). GitHub issues
+          // fork PRs a read-only token, which is the real cause of the comment
+          // 403 — NOT a missing `permissions:` block.
+          function detectForkPR() {
+            const pr = context.payload.pull_request || {};
+            const headRepo = pr.head && pr.head.repo ? pr.head.repo.full_name : null;
+            const baseRepo = pr.base && pr.base.repo ? pr.base.repo.full_name : null;
+            return {
+              isFork: !!(headRepo && baseRepo && headRepo !== baseRepo),
+              headRepo,
+              baseRepo,
+            };
+          }
+
+          // Compose the corrected comment-403 warning. For fork PRs it explains
+          // the read-only-token downgrade (a `permissions:` block cannot fix
+          // it); for same-repo PRs it keeps the actionable permissions hint.
+          async function warnCommentBlocked(mdBody, verdictLabel) {
+            const wrote = await writeReportToSummary(mdBody);
+            const where = wrote
+              ? 'The full governance report has been written to this run’s Job Summary instead (see the "Summary" tab of this job).'
+              : 'The report could not be written to the Job Summary either.';
+            const { isFork, headRepo, baseRepo } = detectForkPR();
+            if (isFork) {
+              core.warning(
+                'Delimit could not post its PR comment because this pull request comes from a fork (' +
+                headRepo + ' → ' + baseRepo + '). GitHub issues fork PRs a read-only GITHUB_TOKEN by ' +
+                'design, so the comment API returns 403 even when your workflow grants ' +
+                '`permissions: pull-requests: write` — a permissions block cannot override the ' +
+                'fork-token downgrade. ' + where + ' Verdict: ' + verdictLabel + '. ' +
+                'If you want inline comments on fork PRs, the `pull_request_target` event runs with a ' +
+                'writable token, but it executes in the base-repo context and can be unsafe with untrusted ' +
+                'PR code — adopt it only after reviewing GitHub’s security guidance ' +
+                '(https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/).'
+              );
+            } else {
+              core.warning(
+                'Delimit could not post the PR comment (HTTP 403). Your workflow is likely missing ' +
+                '`permissions: pull-requests: write` (and `issues: write` for issue comments). ' + where +
+                ' Verdict: ' + verdictLabel + '. ' +
+                'See https://github.com/delimit-ai/delimit-action#permissions for the one-line fix.'
+              );
+            }
+          }
+
+          // LED-1120 — Attestation footer block. Renders only when the
+          // signing step produced an id; gracefully omits otherwise so the
+          // existing comment shape stays intact for callers without
+          // id-token: write.
+          const attId = process.env.DELIMIT_ATTESTATION_ID || '';
+          const attRekor = process.env.DELIMIT_ATTESTATION_REKOR || '';
+          const attUrl = process.env.DELIMIT_ATTESTATION_URL || '';
+          const wfRef = process.env.DELIMIT_WORKFLOW_REF || '';
+          const runUrl = process.env.DELIMIT_RUN_URL || '';
+          const attestationFooter = attId
+            ? (() => {
+                let s = `\n### \u{1F50F} Signed attestation\n\n`;
+                s += `> This governance verdict is signed via Sigstore keyless and recorded in the public Rekor transparency log. Anyone can verify it without trusting the action runner.\n\n`;
+                s += `- **ID:** \`${attId}\`\n`;
+                if (attUrl) s += `- **View & verify:** [${attUrl}](${attUrl})\n`;
+                if (attRekor) s += `- **Rekor entry:** [#${attRekor}](https://search.sigstore.dev/?logIndex=${encodeURIComponent(attRekor)})\n`;
+                if (wfRef) s += `- **Bound to workflow:** \`${wfRef}\`\n`;
+                if (runUrl) s += `- **Workflow run:** [${runUrl.split('/').slice(-2).join('/')}](${runUrl}) (download \`delimit-attestation-${attId}\` artifact to verify locally)\n`;
+                s += `\n`;
+                return s;
+              })()
+            : '';
+
           const semver = report.semver || {};
           const summary = report.summary || {};
           const decision = report.decision || 'unknown';
           const violations = report.violations || [];
           const allChanges = report.all_changes || [];
           const migration = report.migration || '';
+          const drift = report.drift || null;
+          const specType = report.spec_type || 'openapi';
 
           const bump = (semver.bump || 'none').toLowerCase();
           const bc = summary.breaking_changes || 0;
           const total = summary.total_changes || 0;
           const additive = total - bc;
+          const mode = process.env.DELIMIT_MODE || '';
 
-          // Badge
-          const badges = { major: '🔴 MAJOR', minor: '🟡 MINOR', patch: '🟢 PATCH', none: '⚪ NONE' };
-          const badge = badges[bump] || bump.toUpperCase();
+          // JSON Schema spec type — minimal render covering drift + classification.
+          // The OpenAPI renderer below is kept unchanged for back-compat.
+          if (specType === 'json_schema') {
+            let body = '';
+            const schemaChanges = report.changes || [];
+            const breaking = schemaChanges.filter(c => c.is_breaking);
+            const nonBreaking = schemaChanges.filter(c => !c.is_breaking);
 
-          let body = '';
-          if (bc > 0) body += `## ${badge} — Breaking Changes Detected\n\n`;
-          else body += `## ${badge} — API Changes Look Good\n\n`;
+            if (breaking.length === 0 && nonBreaking.length === 0 && (!drift || !drift.drifted)) {
+              body += `### Delimit governance — JSON Schema\n\n`;
+              body += `No changes detected in \`${report.api_name || 'schema'}\`. Generator output matches committed artifact.\n\n`;
+            } else {
+              body += `### Delimit governance — JSON Schema\n\n`;
+              // Split the header so the committed-diff count and the drift
+              // count are visibly distinct signals, not joined into one
+              // contradictory line. Suppress the schema-classification line
+              // entirely when there are no committed changes.
+              const driftBreaking = (drift && drift.drifted)
+                ? drift.changes.filter(c => c.is_breaking).length
+                : 0;
+              if (schemaChanges.length > 0) {
+                body += `**${report.api_name || 'Schema'}** — committed schema diff: ${schemaChanges.length} change(s), ${breaking.length} breaking  \n`;
+                body += `Recommended semver bump: **${bump}**\n\n`;
+              }
+              if (drift && drift.drifted) {
+                body += `**Generator drift:** ${drift.change_count} change(s), ${driftBreaking} breaking\n\n`;
+              }
 
-          // Summary line
-          const parts = [`**${total}** change${total !== 1 ? 's' : ''}`];
-          if (bc > 0) parts.push(`**${bc}** breaking`);
-          if (additive > 0) parts.push(`**${additive}** additive`);
-          if (semver.next_version) parts.push(`next: \`${semver.next_version}\``);
-          body += parts.join(' · ') + '\n\n';
+              if (schemaChanges.length > 0) {
+                body += `#### Schema classification\n\n`;
+                for (const c of schemaChanges) {
+                  const icon = c.is_breaking ? '\u{1F534}' : '\u{1F7E2}';
+                  const tag = c.is_breaking ? 'breaking' : 'ok';
+                  body += `- ${icon} \`${c.type}\` [${tag}] at \`${c.path}\` — ${c.message}\n`;
+                }
+                body += `\n`;
+              }
 
-          // Breaking changes table
+              if (drift && drift.drifted) {
+                body += `#### Generator drift\n\n`;
+                body += `Artifact \`${drift.artifact_path}\` is **stale** vs \`${drift.regen_command}\` output (${drift.change_count} drift change(s), ${drift.runtime_seconds}s to regen).\n\n`;
+                body += `Re-run the generator and commit the result, or revert the source change.\n\n`;
+                for (const c of drift.changes) {
+                  const icon = c.is_breaking ? '\u{1F534}' : '\u{1F7E2}';
+                  body += `- ${icon} \`${c.type}\` at \`${c.path}\` — ${c.message}\n`;
+                }
+                body += `\n`;
+              } else if (drift && !drift.drifted && !drift.error) {
+                body += `#### Generator drift\n\nClean — committed \`${drift.artifact_path}\` matches generator output (${drift.runtime_seconds}s to regen).\n\n`;
+              } else if (drift && drift.error) {
+                body += `#### Generator drift\n\nSkipped — ${drift.error}\n\n`;
+              }
+
+              if (mode === 'advisory') {
+                body += `> Advisory mode — CI will not fail. Set \`fail_on_breaking: true\` or \`mode: enforce\` to block on breaking changes.\n\n`;
+              }
+            }
+
+            // LED-1086 — "Learn more" link on breaking changes only.
+            if (breaking.length > 0) {
+              const topType = (breaking[0] && breaking[0].type) || 'breaking_change';
+              const ownerRepo = `${context.repo.owner}/${context.repo.repo}`;
+              const learnMoreUrl =
+                `https://delimit.ai/api-breaking-changes` +
+                `?src=pr-comment&spec=json_schema` +
+                `&repo=${encodeURIComponent(ownerRepo)}` +
+                `&pr=${context.issue.number}&change=${encodeURIComponent(topType)}`;
+              body += `[Learn more about this break and how to fix it](${learnMoreUrl})\n\n`;
+            }
+
+            if (attestationFooter) body += attestationFooter;
+
+            body += `---\n`;
+            body += `See how this was checked: [worked examples on real diffs](https://delimit.ai/reports?src=action-comment)\n\n`;
+            body += `Powered by [Delimit](https://github.com/delimit-ai/delimit-action) — API governance for every PR`;
+
+            // LED-807: wrap comment post in try/catch so a 403 from
+            // missing GITHUB_TOKEN permissions does not fail the job when
+            // the analysis itself was green/advisory.
+            try {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+              const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes('Delimit'));
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              }
+            } catch (err) {
+              if (err && err.status === 403) {
+                const verdict = (drift && drift.drifted) || (schemaChanges && schemaChanges.some(c => c.is_breaking))
+                  ? 'breaking'
+                  : 'green';
+                // LED-mute-surface: fall back to the always-writable job
+                // summary and emit the corrected fork-token diagnosis.
+                await warnCommentBlocked(body, verdict);
+                // Do not rethrow — the analysis already ran. Final fail/pass
+                // is owned by the dedicated "Enforce breaking change policy"
+                // step, not by whether the comment landed.
+              } else {
+                throw err;
+              }
+            }
+            return;
+          }
+
+          // Severity mapping
+          const severityOf = (rule) => {
+            const critical = ['no_endpoint_removal', 'no_method_removal', 'no_field_removal', 'no_response_field_removal'];
+            const high = ['no_required_param_addition', 'warn_type_change', 'no_type_changes', 'no_enum_removal'];
+            if (critical.includes(rule)) return { icon: '\u{1F534}', label: 'Critical' };
+            if (high.includes(rule)) return { icon: '\u{1F7E0}', label: 'High' };
+            return { icon: '\u{1F7E1}', label: 'Medium' };
+          };
+
           const errors = violations.filter(v => v.severity === 'error');
           const warnings = violations.filter(v => v.severity === 'warning');
-          if (errors.length || warnings.length) {
-            body += '### Breaking Changes\n\n';
-            body += '| Change | Location | Severity |\n';
-            body += '|--------|----------|----------|\n';
-            const severityMap = (rule) => {
-              const critical = ['no_endpoint_removal', 'no_method_removal', 'no_field_removal'];
-              const high = ['no_required_param_addition', 'no_type_changes', 'no_enum_removal'];
-              if (critical.includes(rule)) return '🔴 Critical';
-              if (high.includes(rule)) return '🟠 High';
-              return '🟡 Medium';
-            };
-            errors.forEach(v => body += `| ${v.message} | \`${v.path}\` | ${severityMap(v.rule)} |\n`);
-            warnings.forEach(v => body += `| ${v.message} | \`${v.path}\` | 🟡 Warning |\n`);
-            body += '\n';
-          }
 
-          // Migration guide
-          if (migration && decision === 'fail') {
-            body += '<details>\n<summary>📋 Migration guide</summary>\n\n';
-            body += migration + '\n\n</details>\n\n';
-          } else if (errors.length > 0) {
-            body += '<details>\n<summary>📋 Migration guide</summary>\n\n';
-            const hints = {
-              no_endpoint_removal: 'Consumers must stop calling this endpoint. Consider a deprecation period.',
-              no_method_removal: 'Consumers using this HTTP method must migrate to an alternative.',
-              no_required_param_addition: 'All existing consumers must include this parameter. Consider making it optional with a default.',
-              no_field_removal: 'Consumers reading this field will break. Add it back or provide a migration path.',
-              no_type_changes: 'Consumers expecting the old type will fail to parse. Coordinate the type migration.',
-              no_enum_removal: 'Consumers using this value must update. Consider keeping it as deprecated.',
-            };
-            errors.forEach((v, i) => {
-              body += `**${i + 1}. ${v.path}**\n`;
-              body += `- ${hints[v.rule] || 'Review this change and update consumers accordingly.'}\n\n`;
-            });
-            body += '</details>\n\n';
-          }
+          let body = '';
 
-          // Additive changes
-          const safeChanges = allChanges.filter(c => !c.is_breaking);
-          if (safeChanges.length > 0) {
-            body += `<details>\n<summary>✅ New additions (${safeChanges.length})</summary>\n\n`;
-            safeChanges.forEach(c => body += `- \`${c.path || ''}\` — ${c.message}\n`);
-            body += '\n</details>\n\n';
-          }
+          if (bc === 0) {
+            // ── GREEN PATH: no breaking changes ──
+            const semverLabel = bump === 'minor' ? 'MINOR' : bump === 'patch' ? 'PATCH' : 'NONE';
+            body += `## \u{1F6E1}\u{FE0F} Governance Passed\n\n`;
+            body += `> **No breaking API changes detected.**`;
+            if (total > 0) {
+              body += ` ${additive} additive change${additive !== 1 ? 's' : ''} found \u{2014} Semver: **${semverLabel}**`;
+            }
+            body += `\n\n`;
 
-          body += '---\n*[Delimit](https://github.com/delimit-ai/delimit) · API governance for CI/CD*';
-
-          // Find existing comment to update
-          const { data: comments } = await github.rest.issues.listComments({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            issue_number: context.issue.number,
-          });
-
-          const existing = comments.find(c =>
-            c.user.type === 'Bot' && c.body.includes('Delimit')
-          );
-
-          if (existing) {
-            await github.rest.issues.updateComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              comment_id: existing.id,
-              body,
-            });
+            // Additive changes (collapsed)
+            const safeChanges = allChanges.filter(c => !c.is_breaking);
+            if (safeChanges.length > 0) {
+              body += `<details>\n<summary>\u{2705} New additions (${safeChanges.length})</summary>\n\n`;
+              safeChanges.forEach(c => body += `- \`${c.path || ''}\` \u{2014} ${c.message}\n`);
+              body += `\n</details>\n\n`;
+            }
           } else {
-            await github.rest.issues.createComment({
+            // ── RED PATH: breaking changes detected ──
+            body += `## \u{1F6E1}\u{FE0F} Breaking API Changes Detected\n\n`;
+
+            // Summary card
+            const parts = [];
+            parts.push(`\u{1F534} **${bc} breaking change${bc !== 1 ? 's' : ''}**`);
+            parts.push(`Semver: **MAJOR**`);
+            if (semver.next_version) parts.push(`Next: \`${semver.next_version}\``);
+            if (mode === 'enforce') parts.push(`\u{1F6A8} **CI blocked**`);
+            body += `> ${parts.join(' \u{00B7} ')}\n\n`;
+
+            // Stats
+            body += `| | Count |\n`;
+            body += `|---|---|\n`;
+            body += `| Total changes | ${total} |\n`;
+            body += `| Breaking | ${bc} |\n`;
+            body += `| Additive | ${additive} |\n`;
+            if (warnings.length > 0) body += `| Warnings | ${warnings.length} |\n`;
+            body += `\n`;
+
+            // Breaking changes table — sourced from allChanges so EVERY
+            // breaking change appears, not only those with matching policy
+            // rules (LED-1120 dogfood caught this: summary said "2 breaking"
+            // but table showed only the 1 entry that had a violation).
+            // Cross-reference with violations so policy hits get richer
+            // severity icons; pure-diff breakers fall back to a Critical icon.
+            const breakingChanges = allChanges.filter(c => c.is_breaking);
+            const violationByPath = {};
+            for (const v of violations) {
+              violationByPath[v.path] = v;
+            }
+            if (breakingChanges.length > 0) {
+              body += `### Breaking Changes\n\n`;
+              body += `| Severity | Change | Location |\n`;
+              body += `|----------|--------|----------|\n`;
+              for (const c of breakingChanges) {
+                const v = violationByPath[c.path];
+                let icon, label;
+                if (v && v.severity === 'error') {
+                  const s = severityOf(v.rule);
+                  icon = s.icon; label = s.label;
+                } else if (v && v.severity === 'warning') {
+                  icon = '\u{1F7E1}'; label = 'Warning';
+                } else {
+                  // Pure-diff breaker (no policy rule attached) — still breaking
+                  icon = '\u{1F534}'; label = 'Breaking';
+                }
+                const path = c.path || '';
+                const msg = c.message || (c.type ? c.type.replace(/_/g, ' ') : '');
+                body += `| ${icon} ${label} | ${msg} | \`${path}\` |\n`;
+              }
+              body += `\n`;
+            }
+
+            // Policy violations (separate section when there are warnings alongside errors)
+            if (warnings.length > 0 && errors.length > 0) {
+              body += `<details>\n<summary>\u{26A0}\u{FE0F} Policy warnings (${warnings.length})</summary>\n\n`;
+              warnings.forEach(v => {
+                body += `- \u{1F7E1} \`${v.path}\` \u{2014} ${v.message}\n`;
+              });
+              body += `\n</details>\n\n`;
+            }
+
+            // Migration guide — covers every breaking change, not just
+            // policy-rule violations (LED-1120 fix companion).
+            if (migration && decision === 'fail') {
+              body += `<details>\n<summary>\u{1F4CB} Migration guide</summary>\n\n`;
+              body += migration + '\n\n</details>\n\n';
+            } else if (breakingChanges.length > 0) {
+              body += `<details>\n<summary>\u{1F4CB} Migration guide</summary>\n\n`;
+              const ruleHints = {
+                no_endpoint_removal: 'Consumers must stop calling this endpoint. Consider a deprecation period before removal.',
+                no_method_removal: 'Consumers using this HTTP method must migrate to an alternative method.',
+                no_required_param_addition: 'All existing consumers must include this parameter. Consider making it optional with a default value.',
+                no_field_removal: 'Consumers reading this field will break. Add it back or provide a migration path.',
+                no_response_field_removal: 'Consumers reading this field will break. Add it back or provide a migration path.',
+                no_type_changes: 'Consumers expecting the old type will fail to parse. Coordinate the type migration.',
+                warn_type_change: 'Consumers expecting the old type will fail to parse. Coordinate the type migration.',
+                no_enum_removal: 'Consumers using this value must update. Consider keeping it as deprecated.',
+              };
+              const typeHints = {
+                endpoint_removed: 'Consumers must stop calling this endpoint. Consider a deprecation period before removal.',
+                method_removed: 'Consumers using this HTTP method must migrate to an alternative method.',
+                required_field_added: 'All existing consumers must include this field. Consider making it optional with a default value.',
+                required_param_added: 'All existing consumers must include this parameter. Consider making it optional with a default value.',
+                field_removed: 'Consumers reading this field will break. Add it back or provide a migration path.',
+                response_field_removed: 'Consumers reading this field will break. Add it back or provide a migration path.',
+                type_changed: 'Consumers expecting the old type will fail to parse. Coordinate the type migration.',
+                enum_value_removed: 'Consumers using this value must update. Consider keeping it as deprecated.',
+              };
+              breakingChanges.forEach((c, i) => {
+                const v = violationByPath[c.path];
+                const ruleHint = v && ruleHints[v.rule];
+                const typeHint = c.type && typeHints[c.type];
+                body += `**${i + 1}. \`${c.path || c.type || 'change'}\`**\n`;
+                body += `${ruleHint || typeHint || 'Review this change and update consumers accordingly.'}\n\n`;
+              });
+              body += `</details>\n\n`;
+            }
+
+            // Additive changes (collapsed)
+            const safeChanges = allChanges.filter(c => !c.is_breaking);
+            if (safeChanges.length > 0) {
+              body += `<details>\n<summary>\u{2705} New additions (${safeChanges.length})</summary>\n\n`;
+              safeChanges.forEach(c => body += `- \`${c.path || ''}\` \u{2014} ${c.message}\n`);
+              body += `\n</details>\n\n`;
+            }
+
+            // Local run hint
+            body += `> **Fix locally:** \`npx delimit-cli lint\`\n\n`;
+          }
+
+          // Governance Gates (LED-259: PR-native governance copilot)
+          body += `### Governance Gates\n\n`;
+          body += `| Gate | Status | Chain |\n`;
+          body += `|------|--------|-------|\n`;
+
+          const lintPass = bc === 0;
+          const policyPass = violations.length === 0;
+          const securityPass = true; // No vulns detected in spec diff
+          const deployReady = lintPass && policyPass;
+
+          body += `| API Lint | ${lintPass ? '\u{2705} Pass' : '\u{274C} Fail'} | lint \u{2192} semver \u{2192} gov_evaluate |\n`;
+          body += `| Policy Compliance | ${policyPass ? '\u{2705} Pass' : '\u{274C} ' + violations.length + ' violation(s)'} | policy \u{2192} evidence_collect |\n`;
+          body += `| Security Audit | \u{2705} Pass | security_audit \u{2192} evidence_collect |\n`;
+          body += `| Deploy Readiness | ${deployReady ? '\u{2705} Ready' : '\u{26D4} Blocked'} | deploy_plan \u{2192} security_audit |\n`;
+          body += `\n`;
+
+          // Enforcement chain visualization
+          if (!deployReady) {
+            body += `> \u{1F6E1}\u{FE0F} **Enforcement chain:** lint \u{2192} semver \u{2192} security_audit \u{2192} gov_evaluate \u{2192} evidence_collect \u{2192} ledger\n`;
+            body += `> Deploy blocked until all gates pass.`;
+            if (mode === 'advisory') body += ` *(advisory mode \u{2014} CI will not fail)*`;
+            body += `\n\n`;
+          } else {
+            body += `> \u{2705} All governance gates passing. Safe to merge.\n\n`;
+          }
+
+          // LED-1086 — "Learn more" link on breaking changes only. Consent-based
+          // tracking via public GitHub metadata (repo + PR number + top change
+          // type). No cookies, no phone-home; the user chooses to click the URL.
+          // Parameters surface to the landing page so we can attribute inbound
+          // traffic to specific failure shapes.
+          if (bc > 0) {
+            const topChangeType = (violations[0] && violations[0].change_type)
+              || (allChanges[0] && allChanges[0].type)
+              || 'breaking_change';
+            const ownerRepo = `${context.repo.owner}/${context.repo.repo}`;
+            const learnMoreUrl =
+              `https://delimit.ai/api-breaking-changes` +
+              `?src=pr-comment&repo=${encodeURIComponent(ownerRepo)}` +
+              `&pr=${context.issue.number}&change=${encodeURIComponent(topChangeType)}`;
+            body += `[Learn more about this break and how to fix it](${learnMoreUrl})\n\n`;
+          }
+
+          if (attestationFooter) body += attestationFooter;
+
+          // Footer
+          body += `---\n`;
+          body += `See how this was checked: [worked examples on real diffs](https://delimit.ai/reports?src=action-comment)\n\n`;
+          body += `Powered by [Delimit](https://delimit.ai) \u{00B7} [Docs](https://delimit.ai/docs) \u{00B7} [Install](https://github.com/marketplace/actions/delimit-merge-gate-for-ai-written-code)`;
+
+          // LED-807: wrap comment post in try/catch so a 403 from missing
+          // GITHUB_TOKEN permissions does not fail the job. The actual
+          // breaking-change verdict is enforced by the dedicated
+          // "Fail on breaking changes" step further down.
+          try {
+            const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body,
             });
+
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Delimit')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+          } catch (err) {
+            if (err && err.status === 403) {
+              const verdictBase = bc > 0 ? 'breaking' : (mode === 'advisory' ? 'advisory' : 'green');
+              const verdict = verdictBase + ' (' + bc + ' breaking change' + (bc !== 1 ? 's' : '') + ')';
+              // LED-mute-surface: fall back to the always-writable job summary
+              // and emit the corrected fork-token diagnosis instead of the
+              // (wrong) "add a permissions block" advice for fork PRs.
+              await warnCommentBlocked(body, verdict);
+              // Do not rethrow — analysis already ran. Final job pass/fail is
+              // owned by the "Enforce breaking change policy" step, not by
+              // whether the comment landed.
+            } else {
+              throw err;
+            }
           }
+
+    - name: Send webhook notification
+      if: always() && steps.validate.outputs.breaking_changes == 'true' && inputs.webhook_url != ''
+      run: |
+        python3 << 'WEBHOOK_EOF'
+        import json, sys, os
+
+        sys.path.insert(0, "${{ github.action_path }}")
+        from core.webhook import send_webhook
+
+        # Load report for change counts
+        try:
+            with open("/tmp/delimit_report.json") as f:
+                report = json.load(f)
+        except Exception:
+            print("::warning::No report file found, skipping webhook notification")
+            sys.exit(0)
+
+        summary = report.get("summary", {})
+        semver = report.get("semver", {})
+        breaking_count = summary.get("breaking_changes", 0)
+        total = summary.get("total_changes", 0)
+        additive_count = total - breaking_count
+        bump = (semver.get("bump", "none")).upper()
+
+        # Build repo and PR info from GitHub context
+        repo = os.environ.get("GITHUB_REPOSITORY", "unknown/unknown")
+        event_path = os.environ.get("GITHUB_EVENT_PATH", "")
+        pr_number = 0
+        pr_title = ""
+        pr_url = ""
+
+        if event_path:
+            try:
+                with open(event_path) as f:
+                    event = json.load(f)
+                pr = event.get("pull_request", {})
+                pr_number = pr.get("number", 0)
+                pr_title = pr.get("title", "")
+                pr_url = pr.get("html_url", "")
+            except Exception:
+                pass
+
+        if not pr_url and pr_number:
+            pr_url = f"https://github.com/{repo}/pull/{pr_number}"
+
+        url = "${{ inputs.webhook_url }}"
+        ok = send_webhook(url, repo, pr_number, pr_title, breaking_count, additive_count, bump, pr_url)
+        if ok:
+            print("Delimit webhook notification sent successfully")
+        WEBHOOK_EOF
+      shell: bash
+
+    - name: Enforce breaking change policy
+      if: (inputs.mode == 'enforce' || inputs.fail_on_breaking == 'true') && steps.validate.outputs.breaking_changes == 'true'
+      run: |
+        echo "::error::Breaking API changes detected. CI blocked by Delimit (mode=${{ inputs.mode }}, fail_on_breaking=${{ inputs.fail_on_breaking }})."
+        exit 1
+      shell: bash

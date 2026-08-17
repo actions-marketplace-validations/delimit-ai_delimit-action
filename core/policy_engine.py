@@ -341,15 +341,21 @@ def evaluate_with_policy(
     include_semver: bool = False,
     current_version: Optional[str] = None,
     api_name: Optional[str] = None,
+    context_aware: bool = False,
 ) -> Dict[str, Any]:
     """
     Main entry point for policy evaluation.
+
+    Args:
+        context_aware: LED-1600 opt-in. When True, breaking severity is
+            request/response-direction-aware (response-side additions downgrade
+            to non-breaking). Default False keeps the conservative verdicts.
 
     Returns:
         Dictionary with violations, summary, and decision.
     """
     # Run diff engine
-    diff_engine = OpenAPIDiffEngine()
+    diff_engine = OpenAPIDiffEngine(context_aware=context_aware)
     changes = diff_engine.compare(old_spec, new_spec)
 
     # Run policy engine
@@ -405,12 +411,17 @@ def evaluate_with_policy(
     # Semver classification
     if include_semver:
         try:
-            from core.semver_classifier import classify_detailed, bump_version
+            from core.semver_classifier import SemverBump, classify_detailed, bump_version
             semver_data = classify_detailed(changes)
-            semver_result = {"bump": semver_data["bump"].value}
+            bump_value = semver_data["bump"]
+            semver_result = {"bump": bump_value}
             if current_version:
                 semver_result["current_version"] = current_version
-                semver_result["next_version"] = bump_version(current_version, semver_data["bump"])
+                try:
+                    bump_enum = SemverBump(bump_value)
+                except ValueError:
+                    bump_enum = SemverBump.NONE
+                semver_result["next_version"] = bump_version(current_version, bump_enum)
             result["semver"] = semver_result
         except Exception:
             result["semver"] = {"bump": "none"}

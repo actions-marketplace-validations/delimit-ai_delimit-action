@@ -167,6 +167,32 @@ class TestPolicyEngineDefaultRules(unittest.TestCase):
         self.assertEqual(len(engine.rules), len(PolicyEngine.DEFAULT_RULES))
 
 
+class TestPolicyEngineSemver(unittest.TestCase):
+    """Policy evaluation returns semver metadata for action outputs."""
+
+    def test_breaking_changes_get_major_bump_and_next_version(self):
+        result = evaluate_with_policy(
+            V1,
+            V2_BREAKING,
+            include_semver=True,
+            current_version=V1["info"]["version"],
+            api_name=V1["info"]["title"],
+        )
+        self.assertEqual(result["semver"]["bump"], "major")
+        self.assertEqual(result["semver"]["next_version"], "2.0.0")
+
+    def test_safe_changes_get_minor_bump_and_next_version(self):
+        result = evaluate_with_policy(
+            V1,
+            V2_SAFE,
+            include_semver=True,
+            current_version=V1["info"]["version"],
+            api_name=V1["info"]["title"],
+        )
+        self.assertEqual(result["semver"]["bump"], "minor")
+        self.assertEqual(result["semver"]["next_version"], "1.1.0")
+
+
 # ===================================================================
 # Semver Classifier Tests
 # ===================================================================
@@ -288,7 +314,7 @@ class TestExplainerTemplates(unittest.TestCase):
 
     def test_pr_comment_has_table(self):
         output = explain(self.breaking_changes, template="pr_comment")
-        self.assertIn("| Change | Location | Severity |", output)
+        self.assertIn("| Severity | Change | Location |", output)
         self.assertIn("MAJOR", output)
         self.assertIn("Migration guide", output)
 
@@ -321,23 +347,38 @@ class TestCIFormatterMarkdown(unittest.TestCase):
     def test_markdown_breaking_has_table(self):
         formatter = CIFormatter(OutputFormat.MARKDOWN)
         output = formatter.format_result(self.result_breaking)
-        self.assertIn("| Metric | Value |", output)
+        self.assertIn("| | Count |", output)
         self.assertIn("Total changes", output)
 
     def test_markdown_breaking_has_violations(self):
         formatter = CIFormatter(OutputFormat.MARKDOWN)
         output = formatter.format_result(self.result_breaking)
-        self.assertIn("Violations", output)
+        self.assertIn("Breaking Changes", output)
 
     def test_markdown_breaking_has_footer(self):
         formatter = CIFormatter(OutputFormat.MARKDOWN)
         output = formatter.format_result(self.result_breaking)
-        self.assertIn("ESLint for API contracts", output)
+        self.assertIn("Powered by [Delimit]", output)
 
     def test_markdown_safe_has_good_header(self):
         formatter = CIFormatter(OutputFormat.MARKDOWN)
         output = formatter.format_result(self.result_safe)
-        self.assertIn("Look Good", output)
+        self.assertIn("Governance Passed", output)
+
+    def test_markdown_breaking_has_reports_link(self):
+        # LED-3712: worked-example reports link appears on the breaking path.
+        formatter = CIFormatter(OutputFormat.MARKDOWN)
+        output = formatter.format_result(self.result_breaking)
+        self.assertIn("https://delimit.ai/reports", output)
+        # Distribution measurement: the inbound src is tagged for GA4 attribution.
+        self.assertIn("src=action-comment", output)
+
+    def test_markdown_safe_has_reports_link(self):
+        # LED-3712: worked-example reports link also appears on the clean path.
+        formatter = CIFormatter(OutputFormat.MARKDOWN)
+        output = formatter.format_result(self.result_safe)
+        self.assertIn("https://delimit.ai/reports", output)
+        self.assertIn("src=action-comment", output)
 
     def test_text_format(self):
         formatter = CIFormatter(OutputFormat.TEXT)
